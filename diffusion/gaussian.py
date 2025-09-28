@@ -2,6 +2,7 @@ import math
 import numpy as np
 import torch
 import enum
+from tqdm.auto import tqdm
 
 class ModelVarianceType(enum.Enum):
     FIXED_SMALL = enum.auto()
@@ -226,7 +227,6 @@ class GaussianDiffusion:
         cond_fn=None,
         model_kwargs=None,
         device=None,
-        progress=False,
     ):
         '''Generate all samples'''
         final = None
@@ -234,8 +234,14 @@ class GaussianDiffusion:
             model,
             shape,
             noise=noise,
-
-        )
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            cond_fn=cond_fn,
+            model_kwargs=model_kwargs,
+            device=device,
+        ):
+            final = sample
+        return final['sample']
 
     def p_generate_sample_t(
             self,
@@ -247,7 +253,6 @@ class GaussianDiffusion:
             cond_fn=None,
             model_kwargs=None,
             device=None,
-            progress=False,
     ):
         '''Generate sample from time t'''
         if device is None:
@@ -258,7 +263,22 @@ class GaussianDiffusion:
         else:
             img = torch.randn(*shape, device=device)
         indices = list(range(self.num_timesteps))[::-1]
+        indices = tqdm(indices)
 
-        if progress:
-            from tqdm.auto import tqdm
-            indices = tqdm(indices)
+        for i in indices:
+            t = torch.tensor([i] * shape[0], device=device)
+            with torch.no_grad():
+                out = self.p_sample(
+                    model,
+                    img,
+                    t,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    cond_fn=cond_fn,
+                    model_kwargs=model_kwargs
+                )
+
+                yield out
+                img = out['sample']
+
+        
