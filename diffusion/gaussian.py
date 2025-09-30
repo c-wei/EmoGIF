@@ -185,9 +185,9 @@ class GaussianDiffusion:
         out['mean'],_,_ = self.q_pos_mean_variance(x_0 = out['pred_x0'], x_t=x, t=t)
 
         return out
-    
-
-    def p_sample(
+        
+    # DDIM Implementation
+    def p_ddim_sample(
         self,
         model,
         x,
@@ -196,9 +196,48 @@ class GaussianDiffusion:
         denoised_fn=None,
         cond_fn=None,
         model_kwargs=None,
+        eta=0.0,
     ):
-        '''sample p(x_{t-1}|x_t)'''
+        """DDIM Implementation to sample x_{t-1}"""
+        out = self.p_mean_variance(
+            model,
+            x,
+            t,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            model_kwargs=model_kwargs
+        )
 
+        if cond_fn is not None:
+            out = self.condition_score(cond_fn, out, x, t, model_kwargs=model_kwargs)
+
+        eps = self.eps_from_x0(x, t, out['pred_x0'])
+        a_bar = extract_into_tensor(self.alphas_cumprod, t, x.shape)
+        a_bar_prev = extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
+        sig = (
+            eta * torch.sqrt((1 - a_bar_prev) / (1 - a_bar)) * torch.sqrt(1 - a_bar / a_bar_prev)
+        )
+
+        noise = torch.randn_like(x)
+        pred_mean = ( out['pred_x0'] * torch.sqrt(a_bar_prev) + torch.sqrt(1-a_bar_prev - sig ** 2) * eps)
+        mask = ((t != 0).float().view(-1, *([1] * len(x.shape) -1)))
+
+        sample = pred_mean + mask * sig * noise
+        return {'sample': sample, 'pred_x0': out['pred_x0']}
+    
+    def q_ddim_reverse(
+        self,
+        model,
+        x,
+        t,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        eta=0.0,
+    ):
+        """Sample x_{t+1} to invert deterministic DDIM"""
+        eta=0.0
         out = self.p_mean_variance(
             model,
             x,
@@ -208,29 +247,29 @@ class GaussianDiffusion:
             model_kwargs=model_kwargs,
         )
 
-        noise = torch.randn_like(x)
-        mask = ((t!=0).float().view(-1, *([1] * (len(x.shape) - 1))))
-
         if cond_fn is not None:
-            out['mean'] = self.condition_score(cond_fn, out, x, t, model_kwargs=model_kwargs)
-        sample = out['mean'] + mask * torch.exp(0.5 * out['log_variance']) * noise
-        return {'sample': sample, 'pred_x0': out['pred_x0']}
+            out = self.condition_score(cond_fn, out, x, t, model_kwargs=model_kwargs)
 
-
-    def p_generate_samples(
+        eps=(extract_into_tensor(np.sqrt(1.0/self.alphas_cumprod), t, x.shape) * x - out['pred_x0']) / extract_into_tensor(np.sqrt(1.0/self.alphas_cumprod - 1), t, x.shape)
+        a_bar_next = extract_into_tensor(self.alphas_cumprod_next, t, x.shape)
+        
+        pred_mean=out['pred_x0'] * torch.sqrt(a_bar_next) + torch.sqrt(1-a_bar_next) * eps
+        return {'sample': pred_mean, 'pred_x0': out['pred_x0']}
+    
+    def p_ddim_sampler(
         self,
         model,
         shape,
         noise=None,
         clip_denoised=True,
-        denoised_fn=None,
+        denoised_fn=True,
         cond_fn=None,
         model_kwargs=None,
         device=None,
+        eta=0.0
     ):
-        '''Generate all samples'''
         final = None
-        for sample in self.p_generate_sample_t(
+        for sample in self.p_ddim_generate_sample(
             model,
             shape,
             noise=noise,
@@ -239,27 +278,29 @@ class GaussianDiffusion:
             cond_fn=cond_fn,
             model_kwargs=model_kwargs,
             device=device,
+            eta=eta,
         ):
             final = sample
         return final['sample']
 
-    def p_generate_sample_t(
-            self,
-            model,
-            shape,
-            noise=None,
-            clip_denoised=True,
-            denoised_fn=None,
-            cond_fn=None,
-            model_kwargs=None,
-            device=None,
+
+    def p_ddim_generate_sample(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=True,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        eta=0.0
     ):
-        '''Generate sample from time t'''
-        if device is None:
-            device = next(model.parameters()).device
-        assert isinstance(shape, (tuple,list))
+        if device is not None:
+            device = next(model.paraeters()).device
         if noise is not None:
             img = noise
+        
         else:
             img = torch.randn(*shape, device=device)
         indices = list(range(self.num_timesteps))[::-1]
@@ -268,14 +309,15 @@ class GaussianDiffusion:
         for i in indices:
             t = torch.tensor([i] * shape[0], device=device)
             with torch.no_grad():
-                out = self.p_sample(
+                out = self.p_ddim_sampleddim_sample(
                     model,
                     img,
                     t,
                     clip_denoised=clip_denoised,
                     denoised_fn=denoised_fn,
                     cond_fn=cond_fn,
-                    model_kwargs=model_kwargs
+                    model_kwargs=model_kwargs,
+                    eta=eta,
                 )
 
                 yield out
