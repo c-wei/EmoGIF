@@ -16,6 +16,53 @@ class ModelMeanType(enum.Enum):
     X_0 = enum.auto()
     EPSILON = enum.auto()
 
+def calc_kl(mean1, logvar1, mean2, logvar2):
+    tensor = None
+    for obj in (mean1, logvar1, mean2, logvar2):
+        if isinstance(obj, torch.Tensor):
+            tensor=obj
+            break
+    logvar1, logvar2 = [x if isinstance(x, torch.Tensor) else torch.tensor(x).to(tensor) for x in (logvar1, logvar2)]
+
+    return 0.5 * (-1.0 + logvar2 - logvar1 + torch.exp(logvar1-logvar2) + ((mean1-mean2) ** 2) * torch.exp(-logvar2))
+
+
+def approx_standard_normal_cdf(x):
+    """
+    A fast approximation of the cumulative distribution function of the
+    standard normal.
+    """
+    return 0.5 * (1.0 + torch.tanh(np.sqrt(2.0 / np.pi) * (x + 0.044715 * torch.pow(x, 3))))
+
+def discretized_gaussian_log_likelihood(x, *, means, log_scales):
+    """
+    Compute the log-likelihood of a Gaussian distribution discretizing to a
+    given image.
+    :param x: the target images. It is assumed that this was uint8 values,
+              rescaled to the range [-1, 1].
+    :param means: the Gaussian mean Tensor.
+    :param log_scales: the Gaussian log stddev Tensor.
+    :return: a tensor like x of log probabilities (in nats).
+    """
+    assert x.shape == means.shape == log_scales.shape
+    centered_x = x - means
+    inv_stdv = torch.exp(-log_scales)
+    plus_in = inv_stdv * (centered_x + 1.0 / 255.0)
+    cdf_plus = approx_standard_normal_cdf(plus_in)
+    min_in = inv_stdv * (centered_x - 1.0 / 255.0)
+    cdf_min = approx_standard_normal_cdf(min_in)
+    log_cdf_plus = th.log(cdf_plus.clamp(min=1e-12))
+    log_one_minus_cdf_min = th.log((1.0 - cdf_min).clamp(min=1e-12))
+    cdf_delta = cdf_plus - cdf_min
+    log_probs = torch.where(
+        x < -0.999,
+        log_cdf_plus,
+        torch.where(x > 0.999, log_one_minus_cdf_min, th.log(cdf_delta.clamp(min=1e-12))),
+    )
+    assert log_probs.shape == x.shape
+    return log_probs
+
+
 def warmup_beta(beta_start, beta_end, num_diff_timesteps, warmup_frac):
     betas = beta_end * np.ones(num_diff_timesteps, dtype=np.float64)
     warmup_time = int(num_diff_timesteps * warmup_frac)
@@ -132,7 +179,7 @@ class GaussianDiffusion:
                 self.pos_variance,
                 self.pos_log_variance_clipped,
             ),
-        }[self.model_var_type]
+        }[self.model_variance_type]
         model_variance = extract_into_tensor(model_variance, t, x.shape)
         model_log_variance = extract_into_tensor(model_log_variance, t, x.shape)
 
@@ -323,4 +370,122 @@ class GaussianDiffusion:
                 yield out
                 img = out['sample']
 
+    def var_lower_bound ( self, model, x_0, x_t, t, clip_denoised=True, model_kwargs=None):
+        """Calculate per-step contribution to ELBO"""
+
+        mean, _, log_var = self.q_pos_mean_variance(x_0=x_0, x_t=x_t, t=t)
+        out = self.p_mean_variance(model, x_t, t, clip_denoised=clip_denoised, model_kwargs=model_kwargs)
+        kl = calc_kl(mean, log_var, out['mean'], out['log_variance'])
+        kl = (kl.mean(dim=list(range(1,(len(kl.shape)))))) / np.log(2.0)
+
+        decoder_nll = -discretized_gaussian_log_likelihood(x_0, means=out['mean'], log_scales=0.5 * out['log_variance'])
+        decoder_nll = (decoder_nll.mean(dim=list(range(1,(len(decoder_nll.shape)))))) / np.log(2.0)
+
+        output = torch.where((t==0), decoder_nll, kl)
+        return {'output': output, 'pred_x0': out['pred_x0']}
+
+    def loss(
+        self,
+        model,
+        x_0,
+        t,
+        model_kwargs=None,
+        noise=None,
+    ):
+        """Loss type: rescaledMSE"""
+
+        if model_kwargs is None:
+            model_kwargs={}
+        if noise is None:
+            noise = torch.randn_like(x_0)
+        x_t = self.q_sample(x_0, t, noise=noise)
+
+        terms = {}
+        output = model(x_t, t, **model_kwargs)
+
+        if self.model_variance_type in [
+                ModelVarianceType.LEARNED,
+        ]:
+            B, C = x_t.shape[:2]
+            assert output.shape == (B,C * 2, *x_t.shape[2:])
+            output, var_vals = torch.split(output, C, dim=1)
+
+            detached_out = torch.cat([output.detach(), var_vals], dim=1)
+            terms['vb'] = self.var_lower_bound(
+                model=lambda *args, r=detached_out: r,
+                x_0=x_0,
+                x_t=x_t,
+                t=t,
+                clip_denoised=False,
+            )['output']
+            terms['vb'] *= self.num_timesteps/1000.0
+
+        target = {
+            ModelMeanType.X_PREV: self.q_pos_mean_variance(
+                x_start=x_0, x_t=x_t, t=t
+            )[0],
+            ModelMeanType.X_0: x_0,
+            ModelMeanType.EPSILON: noise,
+        }[self.model_mean_type]
+        assert output.shape == target.shape == x_0.shape
+        terms["mse"] = (((target - output) ** 2).mean(dim=list(range(1,(len(((target - output) ** 2).shape)))))) 
         
+        # Optional VB loss
+        if "vb" in terms:
+            terms["loss"] = terms["mse"] + terms["vb"]
+        else:
+            terms["loss"] = terms["mse"]
+        
+        return terms
+                
+
+    def prior_kl(self, x_0):
+        """Calculate KL[q(x_T|x_0) || p(x_T)]"""
+        batch_size = x_0.shape[0]
+        t = torch.tensor([self.num_timesteps - 1] * batch_size, device=x_0.device)
+        mean, _, log_var = self.q_mean_variance(x_0,t)
+        kl = calc_kl(mean1=mean, logvar1=log_var, mean2=0.0, logvar=0.0)
+        return (kl.mean(dim=list(range(1,(len(kl.shape)))))) / np.log(2.0)
+    
+
+    def calc_kl_loop(self, model, x_0, clip_denoised=True, model_kwargs=None):
+        """Loop backward over timestep & collect per-step KL contributions, error between p(x_0) and x_0, and eps v. true noise"""
+        device = x_0.device
+        batch_size = x_0.shape[0]
+        var_bound=[]
+        x0_mse=[]
+        mse=[]
+
+        for timestep in list(range(self.num_timesteps))[::-1]:
+            t_batch = torch.tensor([timestep] * batch_size, device=device)
+            noise = torch.randn_like(x_0)
+            x_t = self.q_sample(x_0=x_0, t=t_batch, noise=noise)
+            with torch.no_grad():
+                out = self.var_lower_bound(
+                    model,
+                    x_0=x_0,
+                    x_t=x_t,
+                    t=t_batch,
+                    clip_denoised=clip_denoised,
+                    model_kwargs=model_kwargs,
+                )
+            var_bound.append(out['output'])
+            x0_mse.append(((out['pred_x0']-x_0).mean(dim=list(range(1,(len((out['pred_x0']-x_0).shape))))))**2)
+            eps = self.eps_from_x0(x_t, t_batch, out['pred_x0'])
+            mse.append(((eps-noise).mean(dim=list(range(1,(len((eps-noise).shape))))))**2)
+
+
+        var_bound = torch.stack(var_bound, dim=1)
+        x0_mse = torch.stack(x0_mse, dim=1)
+        mse = torch.stack(mse, dim=1)
+
+        prior_kl = self.prior_kl(x_0)
+        total_kl = var_bound.sum(dim=1) + prior_kl
+        return{
+            'total_bound': total_kl,
+            'prior_bound': prior_kl,
+            'var_bound': var_bound,
+            'x0_mse': x0_mse,
+            'mse': mse,
+        }
+
